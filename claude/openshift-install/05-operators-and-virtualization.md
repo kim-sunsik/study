@@ -1685,7 +1685,7 @@ oc get csv -A | grep -v "Succeeded\|NAME"
 다음 흐름이 모두 동작해야 합니다.
 
 ```
-[관리 사이클]
+[관리 사이클 - 컨테이너 트래픽]
 관리자 브라우저
    ↓ https://console-openshift-console.apps.ocp1.example.com
 DNS → 192.168.10.21 (Bastion HAProxy Default Ingress VIP)
@@ -1698,7 +1698,7 @@ console Pod 응답
 ```
 
 ```
-[서비스 사이클]
+[서비스 사이클 - 컨테이너 트래픽]
 사용자 브라우저
    ↓ https://app.svcapps.ocp1.example.com
 DNS → 192.168.20.20 (Bastion HAProxy Service Ingress VIP)
@@ -1711,14 +1711,33 @@ service IngressController → 업무 namespace
 ```
 
 ```
-[VM 사이클]
+[VM 사이클 - VM 트래픽 (Bastion HAProxy 미경유)]
+
+▶ Outbound (VM → 외부)
 VM Guest OS (192.168.20.150)
-   ↓ ip route default 192.168.20.1
-Linux bridge: br-vm-svc (호스트 IP 없음)
+   ↓ Guest OS의 default gateway: 192.168.20.1
+NAD (vm-service-net, cnv-bridge)
    ↓
-ens224 (host NIC, IP 없음)
+Linux bridge: br-vm-svc (호스트 IP 없음, L2 통로)
    ↓
-외부 Service Network
+ens224 (host NIC, IP 없음, bridge port)
+   ↓
+Service망 스위치 (192.168.20.0/24)
+   ↓
+외부 시스템
+
+▶ Inbound (외부 → VM)
+외부 사용자
+   ↓ VM Guest IP(192.168.20.150)로 직접 접근
+     또는 DNS 등록된 VM hostname
+Service망 스위치 (192.168.20.0/24)
+   ↓
+ap/db 노드의 ens224 (bridge port)
+   ↓
+br-vm-svc → NAD → VM Guest OS
+
+★ 어느 단계에서도 Bastion HAProxy를 거치지 않음
+★ Bastion Service Ingress VIP(20.20)는 컨테이너 Route 전용
 ```
 
 ---
