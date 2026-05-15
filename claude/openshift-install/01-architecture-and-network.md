@@ -72,49 +72,92 @@ PoC 환경의 노드 구성은 다음과 같습니다.
 ### 1.2.2 전체 구성도
 
 ```
-                          [ 외부 관리자 ]      [ 외부 사용자 ]
-                                 |                  |
-                                 v                  v
-                    +--------------------+   +--------------------+
-                    | Bastion HAProxy    |   | Bastion HAProxy    |
-                    | (Infra 측)         |   | (Service 측)       |
-                    | 192.168.10.20/21   |   | 192.168.20.20      |
-                    +--------------------+   +--------------------+
-                                 |                  |
-                  +--------------+--------+         |
-                  |              |        |         |
-                  v              v        v         v
-              [Master x3]    [AP x2]   [DB x2]   [PodPool1 x2]
-              Infra NIC      Infra +   Infra +   Infra + Service
-                             VM-svc    VM-svc    NIC
-                             bridge    bridge
+                  [ 외부 관리자 ]         [ 외부 사용자 (컨테이너 앱) ]    [ 외부 사용자 (VM 서비스) ]
+                       │                       │                              │
+                       │                       │                              │ (Bastion 미경유)
+                       │                       │                              │ NAD로 L2 직결
+                       ▼                       ▼                              │
+            ┌────────────────────────────────────────────┐                    │
+            │  Bastion HAProxy (단일 프로세스, 논리 분리) │                    │
+            │  ─────────────────────────────────────────  │                    │
+            │  [Infra 측 frontend]                        │                    │
+            │   - API/MCS    .10.20:6443 / :22623         │                    │
+            │   - Default Ingress  .10.21:80/443          │                    │
+            │  [Service 측 frontend]                      │                    │
+            │   - Service Ingress  .20.20:80/443          │                    │
+            └────────────────────────────────────────────┘                    │
+                       │                       │                              │
+              ┌────────┴──────────┐            │                              │
+              │                   │            │                              │
+              ▼                   ▼            ▼                              │
+         [Master x3]          [AP x2]      [PodPool1 x2]                      │
+         Infra NIC만           Infra NIC    Infra NIC                         │
+         (관리 전용)           (호스트)     + Service NIC                     │
+              │                + ens224     (호스트 IP 양쪽)                  │
+              │                  ↓          → service router (Host            │
+              │                br-vm-svc      Network 80/443)                 │
+              │                bridge                                         │
+              │                (IP 없음,                                      │
+              │                 L2 통로)                                      │
+              │                  │           [DB x2]                          │
+              │                  │           (AP와 동일 NIC 구성)             │
+              │                  │            │                               │
+              │                  ▼            ▼                               │
+              │                ┌──── VM Guest OS ────┐ ◄────────────────────┘
+              │                │ Service IP 직접 보유 │  (외부 ↔ VM 직결)
+              │                │ 192.168.20.100~199  │
+              │                └─────────────────────┘
 
-   Infra + NAS Network (192.168.10.0/24) ─────────────────────┐
-                                                              |
-   Service Network    (192.168.20.0/24) ────────────────┐     |
-                                                        |     |
-                                                        v     v
-                                                  [모든 노드의 NIC]
+  ─── Infra + NAS Network (192.168.10.0/24): 모든 노드 호스트 IP, 관리 트래픽, NAS ───
+  ─── Service Network    (192.168.20.0/24): podpool1 호스트 IP + VM Guest IP        ───
 ```
+
+**그림에서 읽어야 할 핵심:**
+
+1. **관리 트래픽 (Bastion 경유)**
+   외부 관리자 → Bastion Infra VIP(.10.20/.10.21) → master/ap router
+
+2. **컨테이너 업무 트래픽 (Bastion 경유)**
+   외부 사용자 → Bastion Service VIP(.20.20) → podpool1 service router → 업무 Pod
+
+3. **VM 서비스 트래픽 (Bastion 미경유, L2 직결)**
+   외부 사용자 → Service망 스위치 → ap/db의 ens224 (bridge port) → br-vm-svc → VM Guest
+   - VM은 Service망의 일원으로 동작하며, IP를 직접 보유 (192.168.20.100~199)
+   - ap/db 호스트는 Service NIC에 IP가 없고 L2 통로 역할만 함
+   - Bastion HAProxy의 Service Ingress VIP(20.20)는 **컨테이너 업무 전용**이며 VM과 무관
 
 ### 1.2.3 트래픽 흐름 요약
 
-각 트래픽이 어느 망을 통해 어떻게 흐르는지 한눈에 보기 위한 매트릭스입니다.
+각 트래픽이 어느 망을 통해 어떻게 흐르는지 한눈에 보기 위한 매트릭스입니다. **경유 장비 컬럼**을 추가하여 Bastion HAProxy를 거치는 트래픽과 거치지 않는 트래픽을 명확히 구분합니다.
 
-| 트래픽 종류 | 방향 | 망 | 진입/출구 |
-|---|---|---|---|
-| API / kubelet / etcd / MCS | 노드↔노드 | Infra | machineNetwork 내부 통신 |
-| 이미지 pull | 노드→Mirror | Infra | default gateway 경유 |
-| Console / OAuth | 외부→내부 | Infra | Default IngressController (ap 노드) |
-| Monitoring outbound | 내부→외부 | Infra | default gateway 경유 |
-| 업무 앱 inbound | 외부→내부 | Service | Service IngressController (podpool1 노드) |
-| 업무 앱 outbound | 내부→외부 | Service | EgressIP 또는 정책 라우팅 (PoC 검증 항목) |
-| VM inbound | 외부→VM | Service | NAD bridge, Service LB |
-| VM outbound | VM→외부 | Service | VM Guest OS 라우팅 |
-| NAS storage | 노드↔NAS | Infra (PoC) | machineNetwork 내부 |
+| 트래픽 종류 | 방향 | 망 | 경유 장비 | 진입/출구 메커니즘 |
+|---|---|---|---|---|
+| API / kubelet / etcd / MCS | 노드↔노드 | Infra | (직접) | machineNetwork 내부 통신 |
+| API 외부 호출 | 외부→API | Infra | **Bastion HAProxy** | API VIP(.10.20):6443 |
+| MCS (설치 시) | 노드→MCS | Infra | **Bastion HAProxy** | MCS VIP(.10.20):22623 |
+| 이미지 pull | 노드→Mirror | Infra | (직접) | default gateway 경유 |
+| Console / OAuth | 외부→내부 | Infra | **Bastion HAProxy** | Default IngressController (ap 노드) |
+| Monitoring outbound | 내부→외부 | Infra | (직접) | default gateway 경유 |
+| 업무 앱 inbound | 외부→내부 | Service | **Bastion HAProxy** | Service IngressController (podpool1 노드) |
+| 업무 앱 outbound | 내부→외부 | Service | (직접) | EgressIP 또는 정책 라우팅 (PoC 검증 항목) |
+| **VM inbound** | **외부→VM** | **Service** | **(Bastion 미경유, L2 직결)** | **NAD bridge로 VM Guest IP에 직접 도달** |
+| **VM outbound** | **VM→외부** | **Service** | **(Bastion 미경유, L2 직결)** | **VM Guest OS의 default gateway = 192.168.20.1** |
+| NAS storage | 노드↔NAS | Infra (PoC) | (직접) | machineNetwork 내부 |
 
 > **교육 포인트**
 > 운영자 입장에서 "이 트래픽은 어느 망으로 가야 하지?"를 고민하는 것이 아니라, **트래픽의 성격(관리 vs 서비스)이 결정되면 망은 자동으로 결정**되도록 설계하는 것이 핵심입니다.
+
+> **자주 묻는 질문: VM은 외부에서 어떻게 접근하는가?**
+> VM은 Bastion HAProxy를 경유하지 않습니다. Service망의 L2 멤버로서 외부와 직접 통신합니다. 접근 방식은 다음 중에서 환경에 맞춰 선택합니다.
+>
+> | 방식 | 설명 | 본 PoC 적용 |
+> |---|---|---|
+> | **VM Guest IP 직접 접근** | 외부 사용자가 192.168.20.150 같은 VM IP에 직접 접근 (SSH, 웹 등) | PoC 기본 |
+> | **VM DNS 등록** | DNS에 VM hostname을 VM Guest IP로 등록 (예: `app01.vm.ocp1.example.com → 192.168.20.150`) | 권장 |
+> | **별도 VM용 LB** | VM 다수 앞에 별도 LB(HAProxy/F5 등)를 두는 경우 (Bastion과는 무관) | 운영 시 검토 |
+> | **MetalLB** | OpenShift에서 LoadBalancer 타입 Service로 VM에 외부 IP 부여 | 본 PoC 범위 밖 |
+>
+> 핵심은 **Bastion HAProxy의 Service Ingress VIP(192.168.20.20)는 컨테이너 업무 Route 전용**이라는 점입니다. VM 트래픽은 이 VIP와 완전히 별개의 경로로 흐릅니다.
 
 ---
 
@@ -418,6 +461,16 @@ bond1 (Service)
 > **핵심 개념: VM 노드의 Service망은 "노드가 사용하는 망"이 아니라 "VM에게 제공하는 망"**
 > 호스트 OS(RHCOS)는 bond1에 IP를 가지지 않습니다. bond1은 단순히 VM Guest OS가 외부 Service망과 통신할 수 있도록 L2 통로 역할만 합니다.
 > 이 구성으로 VM은 마치 물리 네트워크에 직접 연결된 것처럼 동작하며, 호스트 OS는 VM 서비스 트래픽에 관여하지 않습니다.
+>
+> **외부 → VM 트래픽 흐름 (Bastion 미경유):**
+> ```
+> 외부 사용자 → Service망 스위치 (192.168.20.0/24)
+>             → ap/db 호스트의 ens224 (NIC, IP 없음)
+>             → br-vm-svc (Linux bridge, IP 없음)
+>             → NetworkAttachmentDefinition: vm-service-net
+>             → VM Guest OS (eth1: 192.168.20.150)
+> ```
+> 이 경로의 어느 단계에도 Bastion HAProxy가 등장하지 않습니다. Service망 스위치만 통과하면 VM에 직접 도달합니다.
 
 ### 1.6.3 Container 전용 podpool1 노드
 
@@ -508,12 +561,19 @@ OpenShift는 IngressController를 여러 개 운영할 수 있습니다. 본 PoC
 
 | 구분 | Default IngressController | Service IngressController |
 |---|---|---|
-| 용도 | OpenShift Console, OAuth, 관리 Route | 사용자 업무 애플리케이션 Route |
+| 용도 | OpenShift Console, OAuth, 관리 Route | 사용자 **컨테이너** 업무 애플리케이션 Route |
 | 배치 노드 | ap MCP (PoC) / infra MCP (프로덕션) | podpool1 MCP |
 | 배포 방식 | HostNetwork, 80/443 | HostNetwork, 80/443 |
 | 도메인 | `apps.<cluster>.<domain>` | `svcapps.<cluster>.<domain>` |
-| VIP | 192.168.10.21 (Infra LB) | 192.168.20.20 (Service LB) |
+| VIP | 192.168.10.21 (Bastion HAProxy Infra 측) | 192.168.20.20 (Bastion HAProxy Service 측) |
 | 대상 망 | Infra Network | Service Network |
+| 적용 대상 | OpenShift 자동 Route + 관리 Route | **컨테이너 업무 Route만** (VM 서비스는 별개) |
+
+> **VIP가 적용되는 트래픽 범위**
+> 위 표의 VIP는 모두 **OpenShift Route 객체를 통한 트래픽**에 적용됩니다.
+> - VM은 OpenShift Route를 사용하지 않으므로 이 VIP를 거치지 않습니다.
+> - VM은 Service망 L2 직결로 외부와 통신 (Part 1.6.2 참조).
+> - 즉, Service Ingress VIP(20.20)는 **컨테이너 업무 전용 진입점**입니다.
 
 ### 1.8.2 도메인 분리의 의미
 
